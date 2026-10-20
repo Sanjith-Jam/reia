@@ -1,0 +1,8 @@
+/target
+/state
+/cache
+.env
+*.db
+*.db-wal
+*.db-shm
+*.db-wal

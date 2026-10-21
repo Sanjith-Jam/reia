@@ -3,6 +3,7 @@ pub mod app;
 pub mod config;
 pub mod knowledge;
 pub mod polls;
+pub mod sponsors;
 pub mod storage;
 pub mod whatsapp;
 

@@ -1,11 +1,13 @@
 use crate::{Chat, Message, PollDraft, SourceScope};
 use anyhow::{Context, Result, bail};
+use std::io::{self, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::sync::{
     Arc, Mutex, RwLock,
     atomic::{AtomicBool, Ordering},
 };
 use tokio::sync::mpsc;
+use whatsapp_rust::download::DownloadWriter;
 use whatsapp_rust::features::PollVoteCiphertext;
 use whatsapp_rust::prelude::{Bot, BotHandle, Client, Jid, MessageBuilderExt, MessageExt, wa};
 use whatsapp_rust::store::SqliteStore;
@@ -16,13 +18,23 @@ use whatsapp_rust::wacore::poll::compute_option_hash;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Event {
     Qr(String),
-    Connected { owner_jid: String },
+    Connected {
+        owner_jid: String,
+    },
     Chat(Chat),
     Message(Message),
+    VoiceNote {
+        chat_id: String,
+        message_id: String,
+        timestamp: i64,
+        audio: Vec<u8>,
+    },
     PollUpdate(PollUpdate),
     Disconnected(String),
     Error(String),
 }
+
+const MAX_VOICE_NOTE_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Encrypted live vote data or the option hashes already present in history.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -200,6 +212,27 @@ impl WhatsApp {
                                     text: text.to_owned(),
                                     is_live: true,
                                 }));
+                            }
+                            if info.source.is_from_me
+                                && let Some(audio) =
+                                    inbound.message.get_base_message().audio_message.as_option()
+                                && let Some(declared_size) = voice_note_size(audio)
+                                && let Ok(writer) = task_client
+                                    .download_to_writer(
+                                        audio,
+                                        BoundedVoiceWriter::new(declared_size),
+                                    )
+                                    .await
+                            {
+                                let audio = writer.into_inner();
+                                if audio.len() as u64 <= MAX_VOICE_NOTE_BYTES {
+                                    let _ = event_tx.send(Event::VoiceNote {
+                                        chat_id: chat_id.clone(),
+                                        message_id: info.id.as_str().to_owned(),
+                                        timestamp: info.timestamp.timestamp(),
+                                        audio,
+                                    });
+                                }
                             }
                             if let Some(update) = inbound
                                 .message
@@ -383,6 +416,101 @@ pub fn poll_choices(options: &[String], selected_hashes: &[Vec<u8>]) -> Option<V
     Some(choices)
 }
 
+fn voice_note_size(audio: &wa::message::AudioMessage) -> Option<usize> {
+    if !audio.ptt.unwrap_or(false) {
+        return None;
+    }
+    let length = audio.file_length?;
+    if length > MAX_VOICE_NOTE_BYTES {
+        return None;
+    }
+    usize::try_from(length).ok()
+}
+
+struct BoundedVoiceWriter {
+    bytes: Vec<u8>,
+    position: u64,
+    limit: usize,
+}
+
+impl BoundedVoiceWriter {
+    fn new(capacity: usize) -> Self {
+        Self {
+            bytes: Vec::with_capacity(capacity),
+            position: 0,
+            limit: capacity,
+        }
+    }
+
+    fn into_inner(self) -> Vec<u8> {
+        self.bytes
+    }
+}
+
+impl Write for BoundedVoiceWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let start = usize::try_from(self.position).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "voice note offset overflow")
+        })?;
+        let end = start.checked_add(bytes.len()).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "voice note size overflow")
+        })?;
+        if end > self.limit {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "voice note exceeds size limit",
+            ));
+        }
+        if start > self.bytes.len() {
+            self.bytes.resize(start, 0);
+        }
+        if end > self.bytes.len() {
+            self.bytes.resize(end, 0);
+        }
+        self.bytes[start..end].copy_from_slice(bytes);
+        self.position = end as u64;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Seek for BoundedVoiceWriter {
+    fn seek(&mut self, from: SeekFrom) -> io::Result<u64> {
+        let position = match from {
+            SeekFrom::Start(position) => i128::from(position),
+            SeekFrom::Current(offset) => i128::from(self.position) + i128::from(offset),
+            SeekFrom::End(offset) => self.bytes.len() as i128 + i128::from(offset),
+        };
+        if !(0..=self.limit as i128).contains(&position) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "voice note seek exceeds size limit",
+            ));
+        }
+        self.position = position as u64;
+        Ok(self.position)
+    }
+}
+
+impl DownloadWriter for BoundedVoiceWriter {
+    fn truncate(&mut self, length: u64) -> io::Result<()> {
+        let length = usize::try_from(length)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "voice note size overflow"))?;
+        if length > self.bytes.len() || length > self.limit {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "cannot extend voice note while truncating",
+            ));
+        }
+        self.bytes.truncate(length);
+        self.position = self.position.min(length as u64);
+        Ok(())
+    }
+}
+
 struct Bridge(mpsc::UnboundedSender<Arc<wa_events::Event>>);
 
 fn stop_bot(bot: &Arc<Mutex<Option<BotHandle>>>) {
@@ -536,7 +664,40 @@ fn normalize_jid_or_raw(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_history, poll_choices};
+    use super::{
+        BoundedVoiceWriter, MAX_VOICE_NOTE_BYTES, parse_history, poll_choices, voice_note_size,
+    };
+    use std::io::Write;
+
+    #[test]
+    fn voice_note_gate_requires_ptt_and_a_declared_size_within_limit() {
+        use whatsapp_rust::prelude::wa;
+
+        let audio = |ptt, file_length| wa::message::AudioMessage {
+            ptt,
+            file_length,
+            ..Default::default()
+        };
+        assert_eq!(
+            voice_note_size(&audio(Some(true), Some(MAX_VOICE_NOTE_BYTES))),
+            Some(16 * 1024 * 1024)
+        );
+        assert_eq!(
+            voice_note_size(&audio(Some(true), Some(MAX_VOICE_NOTE_BYTES + 1))),
+            None
+        );
+        assert_eq!(voice_note_size(&audio(Some(false), Some(10))), None);
+        assert_eq!(voice_note_size(&audio(None, Some(10))), None);
+        assert_eq!(voice_note_size(&audio(Some(true), None)), None);
+    }
+
+    #[test]
+    fn voice_note_writer_rejects_bytes_beyond_the_hard_cap() {
+        let mut writer = BoundedVoiceWriter::new(4);
+        writer.write_all(&[1, 2, 3, 4]).unwrap();
+        assert!(writer.write_all(&[5]).is_err());
+        assert_eq!(writer.into_inner(), [1, 2, 3, 4]);
+    }
 
     #[test]
     fn poll_choices_uses_upstream_option_hashes_and_rejects_unknown_values() {

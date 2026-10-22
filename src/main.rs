@@ -7,7 +7,7 @@ use reia::{
 };
 use std::{
     collections::BTreeSet,
-    io::{self, Write},
+    io::{self, IsTerminal, Write},
     path::{Path, PathBuf},
 };
 
@@ -56,10 +56,7 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Command::Setup => {
-            config.save(&config_path)?;
-            println!(
-                "Configuration saved. Run `reia run` and scan the WhatsApp QR code to link this device."
-            );
+            setup(&mut config, &config_path).await?;
         }
         Command::Run => reia::app::run(&data_dir, &config_path).await?,
         Command::Doctor => doctor(&config).await?,
@@ -178,6 +175,71 @@ async fn main() -> Result<()> {
                 println!("Removed @{alias}.");
             }
         },
+    }
+    Ok(())
+}
+
+async fn setup(config: &mut Config, config_path: &Path) -> Result<()> {
+    if io::stdin().is_terminal() {
+        println!(
+            "Sponsor setup stores keys in your OS keyring, never in chat or config. Paper Instruments receives each asked question and matching chat excerpts; Browserbase gets current-information queries; Backboard receives saved notes and searches them in your self-chat; ElevenLabs receives your voice-note audio."
+        );
+        for (label, key, env) in [
+            ("Backboard memory", "backboard-api-key", "BACKBOARD_API_KEY"),
+            (
+                "Browserbase web research",
+                "browserbase-api-key",
+                "BROWSERBASE_API_KEY",
+            ),
+            (
+                "Paper Instruments answers",
+                "paperinstruments-api-key",
+                "PAPERINSTRUMENTS_API_KEY",
+            ),
+            (
+                "ElevenLabs voice transcription",
+                "elevenlabs-api-key",
+                "ELEVENLABS_API_KEY",
+            ),
+        ] {
+            let configured = storage::secret_configured(key)?
+                || std::env::var(env).is_ok_and(|value| !value.trim().is_empty());
+            let prompt = if configured {
+                format!("{label} API key (Enter keeps current, blank skips): ")
+            } else {
+                format!("{label} API key (Enter skips): ")
+            };
+            let secret = rpassword::prompt_password(prompt)?;
+            if !secret.trim().is_empty() {
+                storage::set_secret(key, secret.trim())?;
+            }
+        }
+    }
+    let backboard_key = storage::get_secret("backboard-api-key")?.or_else(|| {
+        std::env::var("BACKBOARD_API_KEY")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+    });
+    if config.backboard_assistant_id.is_none()
+        && let Some(key) = backboard_key
+    {
+        let client = reia::sponsors::backboard::BackboardClient::new(key)?;
+        let assistant = client
+            .create_assistant(
+                "Reia",
+                Some("Store user-approved personal notes for private assistant recall."),
+            )
+            .await?;
+        config.backboard_assistant_id = Some(assistant.assistant_id);
+    }
+    config.save(config_path)?;
+    println!(
+        "Configuration saved. Run `reia run` and scan the WhatsApp QR code to link this device."
+    );
+    if !io::stdin().is_terminal() {
+        println!(
+            "API-key prompts need a terminal; run `reia setup` interactively to configure sponsor services."
+        );
     }
     Ok(())
 }

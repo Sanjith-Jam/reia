@@ -1,6 +1,6 @@
 use crate::{Chat, Message, SourceScope};
 use anyhow::{Context, Result, bail};
-use rusqlite::{Connection, params, params_from_iter};
+use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 use std::{collections::BTreeSet, path::Path};
 
 const MAX_QUERY_CHARS: usize = 2048;
@@ -60,6 +60,10 @@ impl KnowledgeStore {
             CREATE TABLE IF NOT EXISTS notes (
                 note_id TEXT PRIMARY KEY,
                 body TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS note_memories (
+                note_id TEXT PRIMARY KEY,
+                memory_id TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS chats (
                 chat_id TEXT PRIMARY KEY,
@@ -170,8 +174,29 @@ impl KnowledgeStore {
         let tx = self.db.transaction()?;
         tx.execute("DELETE FROM note_search WHERE note_id = ?1", [note_id])?;
         tx.execute("DELETE FROM notes WHERE note_id = ?1", [note_id])?;
+        tx.execute("DELETE FROM note_memories WHERE note_id = ?1", [note_id])?;
         tx.commit()?;
         Ok(())
+    }
+
+    pub fn link_note_memory(&mut self, note_id: &str, memory_id: &str) -> Result<()> {
+        self.db.execute(
+            "INSERT INTO note_memories (note_id, memory_id) VALUES (?1, ?2)
+             ON CONFLICT(note_id) DO UPDATE SET memory_id = excluded.memory_id",
+            params![note_id, memory_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn note_memory(&self, note_id: &str) -> Result<Option<String>> {
+        Ok(self
+            .db
+            .query_row(
+                "SELECT memory_id FROM note_memories WHERE note_id = ?1",
+                [note_id],
+                |row| row.get(0),
+            )
+            .optional()?)
     }
 
     pub fn revoke_chats(&mut self, allowed: &BTreeSet<String>) -> Result<()> {
@@ -444,6 +469,19 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn forgotten_notes_drop_their_backboard_memory_link() {
+        let mut store = store();
+        store.add_note("n1", "remember this").unwrap();
+        store.link_note_memory("n1", "memory-1").unwrap();
+        assert_eq!(
+            store.note_memory("n1").unwrap().as_deref(),
+            Some("memory-1")
+        );
+        store.forget_note("n1").unwrap();
+        assert_eq!(store.note_memory("n1").unwrap(), None);
     }
 
     #[test]

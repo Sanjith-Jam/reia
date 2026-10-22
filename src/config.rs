@@ -13,6 +13,7 @@ pub struct Config {
     pub ollama_url: String,
     pub model: String,
     pub workspaces: Vec<Workspace>,
+    pub backboard_assistant_id: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -39,6 +40,7 @@ impl Default for Config {
             ollama_url: "http://127.0.0.1:11434".into(),
             model: "gemma4:e2b".into(),
             workspaces: Vec::new(),
+            backboard_assistant_id: None,
         }
     }
 }

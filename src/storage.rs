@@ -5,6 +5,26 @@ use std::path::{Path, PathBuf};
 const SERVICE: &str = "reia-local-assistant";
 const USER: &str = "knowledge-database-key";
 
+pub fn get_secret(name: &str) -> Result<Option<String>> {
+    let entry = Entry::new(SERVICE, name).context("could not access the OS keyring")?;
+    match entry.get_password() {
+        Ok(secret) => Ok(Some(secret)),
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(error) => Err(error).context("could not read a credential from the OS keyring"),
+    }
+}
+
+pub fn set_secret(name: &str, secret: &str) -> Result<()> {
+    Entry::new(SERVICE, name)
+        .context("could not access the OS keyring")?
+        .set_password(secret)
+        .context("could not save a credential to the OS keyring")
+}
+
+pub fn secret_configured(name: &str) -> Result<bool> {
+    Ok(get_secret(name)?.is_some())
+}
+
 pub fn data_dir() -> Result<PathBuf> {
     let path = dirs::data_local_dir()
         .context("could not locate the local application data directory")?

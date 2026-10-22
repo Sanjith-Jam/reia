@@ -14,6 +14,7 @@ keyring = "3"
 log = "0.4"
 qrcode = "0.14"
 rand = "0.9"
+rpassword = "7"
 reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls"] }
 rusqlite = { version = "0.40", features = ["bundled-sqlcipher-vendored-openssl"] }
 serde = { version = "1", features = ["derive"] }

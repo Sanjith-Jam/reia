@@ -8,7 +8,7 @@ use crate::{
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
-const MAX_CONTEXT_HITS: usize = 8;
+const MAX_CONTEXT_HITS: usize = 16;
 const MAX_CONTEXT_CHARS: usize = 24_000;
 
 #[derive(Clone, Debug)]
